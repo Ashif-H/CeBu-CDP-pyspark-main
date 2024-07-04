@@ -857,6 +857,11 @@
             "columnName": "Status",
             "dataType": "integer",
             "defaultValue": 999
+        },
+        {
+            "columnName": "IsCsp",
+            "dataType": "string",
+            "defaultValue": "Unknown"
         }
 
 
