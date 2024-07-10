@@ -25,6 +25,22 @@ import pandas as pd
 from pyspark.sql.functions import year, when, floor
 import boto3
 
+def get_paths(day0_date,end_date,path,LOGGER):
+    bucket_name = path.split("/")[2]
+    prefix = "ucp/"
+    s3 = boto3.client('s3')
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix, Delimiter='/')
+
+    
+    paths = []
+    for common_prefix in response.get('CommonPrefixes', []):
+        folder_name = common_prefix['Prefix']
+        date_str = folder_name.split("=")[-1].rstrip('/')
+        if day0_date <= date_str <= end_date:
+            s3_path = 's3a://{}/ucp/p_date={}/'.format(bucket_name,date_str)
+            paths.append(s3_path)
+    return paths
+
 
 def get_config(file_path):
     # file_path = "s3a://cebu-cdp-data-qa/script/glue/cebu-cdp-profile-glue/profile_config_cebu_v1.json"
@@ -43,6 +59,41 @@ def most_travelled(my_list):
     json_string = json.dumps(result_dict)
     return json_string
 
+@udf()
+def most_travelledOrigin(my_list):
+    result_dict = dict()
+    for row in my_list:
+        k = row['TravelOrigin']
+        v = row['numRows']
+        k = 'Unknown' if k is None else ('Unknown' if k.strip()=='' else k)
+        if k not in result_dict.keys():
+            result_dict[k]=0
+        result_dict[k]+=v
+    return json.dumps(result_dict)
+
+@udf()
+def most_travelledSeat(my_list):
+    result_dict = dict()
+    for row in my_list:
+        k = row['TravelSeat']
+        v = row['numRows']
+        k = 'Unknown' if k is None else ('Unknown' if k.strip()=='' else k)
+        if k not in result_dict.keys():
+            result_dict[k]=0
+        result_dict[k]+=v
+    return json.dumps(result_dict)
+
+@udf()
+def most_travelledDestination(my_list):
+    result_dict = dict()
+    for row in my_list:
+        k = row['TravelDestination']
+        v = row['numRows']
+        k = 'Unknown' if k is None else ('Unknown' if k.strip()=='' else k)
+        if k not in result_dict.keys():
+            result_dict[k]=0
+        result_dict[k]+=v
+    return json.dumps(result_dict)
 
 @udf()
 def booker_timeline(
@@ -73,6 +124,20 @@ def booker_timeline(
         }
     json_string = json.dumps(timeline)
     return json_string
+
+@udf()
+def booker_timeline_new(rows):
+    return_val = dict()
+    for idx, row in enumerate(rows):
+        return_val[idx] = row
+    return json.dumps(return_val)
+
+@udf()
+def passenger_timeline_new(rows):
+    return_val = dict()
+    for idx, row in enumerate(rows):
+        return_val[idx] = row
+    return json.dumps(return_val)
 
 
 @udf()
@@ -105,7 +170,7 @@ def passenger_timeline(
     return json_string
 
 
-def booker_compute(spark, df, save_path_prefix):
+def booker_compute(spark, df, save_path_prefix, LOGGER):
     lst = [
         "BookingMonth",
         "TravelMeals",
@@ -123,9 +188,42 @@ def booker_compute(spark, df, save_path_prefix):
 
     dfs = {}
     dfs1 = {}
-    query = "SELECT PersonID,MAX(BookerFirstName) AS BookerFirstName,MAX(BookerLastName) AS BookerLastName,MAX(BookerEmailAddress) AS BookerEmailAddress,MAX(BookerMobile) AS BookerMobile,SUM(New_Revenue) AS TotalRevenue,MAX(BookerType) AS BookerType,MAX(BookerCity) AS BookerCity,Max(Bookingdate) AS LatestDate,MIN(Bookingdate) AS FirstDate, COUNT(DISTINCT passenger_hash) AS UniqueClients , COUNT(PassengerID) AS TotalPassengers"
+    aggFunc = {
+        "BookerFirstName": F.max("BookerFirstName"),
+        "BookerLastName": F.max("BookerLastName"),
+        "BookerEmailAddress": F.max("BookerEmailAddress"),
+        "BookerMobile": F.max("BookerMobile"),
+        "BookerType": F.max("BookerType"),
+        "BookerCity": F.max("BookerCity"),
+        "LatestDate": F.max("LatestDate"),
+        "FirstDate": F.min("FirstDate"),
+        #"UniqueClients": F.size(F.array_distinct(F.flatten(F.collect_list("UniqueClients"))))
+    }
+    # COLLECT_SET(passenger_hash)
+    # AS
+    # UniqueClients,
+    result0 = spark.sql("select PersonID, count (distinct (passenger_hash)) as UniqueClients from cdp_profiles group by PersonID")
+    result0.cache()
+    checkpoint_str = result0.orderBy(F.desc("UniqueClients")).limit(5).toPandas().to_csv(index=False)
+    LOGGER.info("bookerccai checkpoint-1 : \n" + str(checkpoint_str))
+    query = """SELECT PersonID,
+                      TravelOrigin,
+                      TravelDestination,
+                      TravelSeat,
+                      count(*) as numRows,
+                      MAX(BookerFirstName) AS BookerFirstName,
+                      MAX(BookerLastName) AS BookerLastName,
+                      MAX(BookerEmailAddress) AS BookerEmailAddress,
+                      MAX(BookerMobile) AS BookerMobile,
+                      SUM(New_Revenue) AS TotalRevenue,
+                      MAX(BookerType) AS BookerType,
+                      MAX(BookerCity) AS BookerCity,
+                      Max(Bookingdate) AS LatestDate,
+                      MIN(Bookingdate) AS FirstDate, 
+                      COUNT(PassengerID) AS TotalPassengers"""
     for i in lst:
         dfs[i] = [row[0] for row in df.select(i).distinct().collect()]
+        LOGGER.info("bookerccai - Distincts {} -> {}".format(i,len(dfs[i])))
         dfs1[i] = [
             word.replace(" ", "_space1_")
             .replace("-", "_space2_")
@@ -143,26 +241,64 @@ def booker_compute(spark, df, save_path_prefix):
                 + i
                 + "_separator_"
                 + k
-                + ""
+                + " "
             )
 
     spark.udf.register("most_travelled", most_travelled)
-    query += ",most_travelled(collect_list(TravelOrigin)) AS TravelOrigin,most_travelled(collect_list(TravelDestination)) AS TravelDestination,most_travelled(collect_list(TravelSeat)) AS TravelSeat"
-    query += " FROM cdp_profiles GROUP BY PersonID"
+    #query += ",most_travelled(collect_list(TravelOrigin)) AS TravelOrigin,most_travelled(collect_list(TravelDestination)) AS TravelDestination,most_travelled(collect_list(TravelSeat)) AS TravelSeat"
+    query += " FROM cdp_profiles GROUP BY PersonID,TravelOrigin,TravelDestination,TravelSeat"
     # print(query)
-    result1 = spark.sql(query)
+
+    checkpoint_str = spark.sql("select PersonID, count(*) as cnt from cdp_profiles group by PersonID").orderBy(F.desc("cnt")).limit(5).toPandas().to_csv(index=False)
+    LOGGER.info("bookerccai checkpoint-1 : \n"+str(checkpoint_str))
+    result1_pre = spark.sql(query)
+    result1_pre.cache()
+    cols_result1_pre = list(result1_pre.columns)[5:]
+
+    LOGGER.info("bookerccai checkpoint-1.5 -> result1_pre count : "+str(result1_pre.count()))
+
+    result1 = result1_pre.groupBy("PersonID").agg(
+        *[aggFunc.get(colName,F.sum(colName)).alias(colName) for colName in cols_result1_pre],
+        most_travelledOrigin(F.collect_list(F.struct("TravelOrigin","numRows"))).alias("TravelOrigin"),
+        most_travelledDestination(F.collect_list(F.struct("TravelDestination", "numRows"))).alias("TravelDestination"),
+        most_travelledSeat(F.collect_list(F.struct("TravelSeat", "numRows"))).alias("TravelSeat")
+    ).join(result0, ['PersonID'],"left")
+
+    result1.cache()
+    LOGGER.info("bookerccai checkpoint-2 -> Result1 count : "+str(result1.count()))
+    LOGGER.info("bookerccai checkpoint-2 -> Result1 df sample : \n"+str(result1.limit(5).toPandas().to_csv(index=False)))
+
+
+
     result2 = spark.sql(
         """
-    SELECT PersonID, booker_timeline(collect_list(New_Revenue), collect_list(TravelDate),collect_list(BookingDate), collect_list(TravelOrigin), collect_list(TravelDestination), collect_list(TravelInsurance), collect_list(TravelBaggage), collect_list(TravelMeals), collect_list(BookingCurrency),collect_list(RecordLocator)) AS Details
+    SELECT PersonID, 
+            booker_timeline_new(collect_list(
+            from_json(to_json(struct(TravelOrigin as origin,
+                                TravelDestination as destination,
+                                TravelInsurance as insurance,
+                                TravelBaggage as baggage,
+                                TravelMeals as meals,
+                                split(TravelDate,' ')[0] as travel_date,
+                                split(BookingDate,' ')[0] as booking_date,
+                                New_Revenue as revenue,
+                                BookingCurrency as currency,
+                                RecordLocator as record_locator,
+                                IsCsp
+                                )), 'map<string,string>'))) as Details
     FROM (
-        SELECT PersonID,New_Revenue,TravelDate,BookingDate,TravelOrigin,TravelDestination,TravelDestination,TravelInsurance,TravelBaggage,TravelMeals,BookingCurrency,RecordLocator,
+        SELECT PersonID,New_Revenue,TravelDate,BookingDate,TravelOrigin,TravelDestination,TravelDestination,TravelInsurance,TravelBaggage,TravelMeals,BookingCurrency,RecordLocator,IsCsp,
             ROW_NUMBER() OVER (PARTITION BY PersonID ORDER BY TravelDate DESC) AS row_num 
         FROM cdp_profiles
     ) AS subquery 
-    WHERE row_num <= 1000
+    WHERE row_num <= 250
     GROUP BY PersonID
     """
     )
+    LOGGER.info("bookerccai checkpoint-3 -> Result1 count : "+str(result2.count()))
+    checkpoint_str=result2.withColumn("strlen_details",F.length("Details")).select("PersonID","strlen_details").orderBy(F.desc("strlen_details")).limit(5).toPandas().to_csv(index=False)
+    LOGGER.info("bookerccai checkpoint-4 : \n"+str(checkpoint_str))
+
     result = result1.join(result2, "PersonID")
     result.write.parquet(save_path_prefix + "/booker_details", mode="overwrite")
 
@@ -181,7 +317,25 @@ def passenger_compute(spark, df, save_path_prefix, LOGGER):
     # lst=['BookingMonth','TravelMeals','BookingChannel','IsEmployee','TravelBaggage','Gender','IsEmployeeDependent','TravelSoloOrGroup','IsRegistered','BookingCurrency']
     dfs = {}
     dfs1 = {}
-    query = "SELECT passenger_hash,MAX(FirstName) AS FirstName,MAX(MiddleName) AS MiddleName,MAX(LastName) AS LastName,MAX(HonorificPrefix) AS HonorificPrefix,MAX(HonorificSuffix) AS HonorificSuffix,MAX(EmailAddress) AS EmailAddress,MAX(Phone) AS Phone,MAX(Gender) AS Gender,MAX(ProvisionalPrimaryKey) AS ProvisionalPrimaryKey,MAX(DateOfBirth) AS DateOfBirth,MAX(Zipcode) AS Zipcode,MAX(Nationality) AS Nationality,MAX(City) AS City,MAX(State) AS State,Max(Bookingdate) AS LatestDate,MIN(Bookingdate) AS FirstDate,COUNT(PassengerID) AS TotalBookings,SUM(New_Revenue) AS TotalRevenue"
+    query = """SELECT passenger_hash,
+                      MAX(FirstName) AS FirstName,
+                      MAX(MiddleName) AS MiddleName,
+                      MAX(LastName) AS LastName,
+                      MAX(HonorificPrefix) AS HonorificPrefix,
+                      MAX(HonorificSuffix) AS HonorificSuffix,
+                      MAX(EmailAddress) AS EmailAddress,
+                      MAX(Phone) AS Phone,
+                      MAX(Gender) AS Gender,
+                      MAX(ProvisionalPrimaryKey) AS ProvisionalPrimaryKey,
+                      MAX(DateOfBirth) AS DateOfBirth,
+                      MAX(Zipcode) AS Zipcode,
+                      MAX(Nationality) AS Nationality,
+                      MAX(City) AS City,
+                      MAX(State) AS State,
+                      Max(Bookingdate) AS LatestDate,
+                      MIN(Bookingdate) AS FirstDate,
+                      COUNT(PassengerID) AS TotalBookings,
+                      SUM(New_Revenue) AS TotalRevenue"""
     for i in lst:
         dfs[i] = [row[0] for row in df.select(i).distinct().collect()]
         dfs1[i] = [
@@ -216,15 +370,28 @@ def passenger_compute(spark, df, save_path_prefix, LOGGER):
     # result1.write.mode("overwrite").parquet("s3a://cebu-cdp-data-dev/dedupe-cluster-2")
 
     LOGGER.info("ccai ui compute passenger first query completed" + str(result1.count()))
+    # replaced from below code-> passenger_timeline(collect_list(Revenue), collect_list(TravelDate),collect_list(BookingDate),collect_list(TravelOrigin), collect_list(TravelDestination), collect_list(TravelInsurance), collect_list(TravelBaggage), collect_list(TravelMeals),collect_list(RecordLocator)) AS Details
     result2 = spark.sql(
         """
-    SELECT passenger_hash, passenger_timeline(collect_list(Revenue), collect_list(TravelDate),collect_list(BookingDate),collect_list(TravelOrigin), collect_list(TravelDestination), collect_list(TravelInsurance), collect_list(TravelBaggage), collect_list(TravelMeals),collect_list(RecordLocator)) AS Details
+    SELECT passenger_hash, 
+    passenger_timeline_new(collect_list(
+            from_json(to_json(struct(TravelOrigin as origin,
+                                TravelDestination as destination,
+                                TravelInsurance as insurance,
+                                TravelBaggage as baggage,
+                                TravelMeals as meals,
+                                split(TravelDate,' ')[0] as travel_date,
+                                split(BookingDate,' ')[0] as booking_date,
+                                Revenue as revenue,
+                                RecordLocator as record_locator,
+                                IsCsp
+                                )), 'map<string,string>'))) as Details
     FROM (
-        SELECT passenger_hash,Revenue,TravelDate,BookingDate,TravelOrigin,TravelDestination,TravelDestination,TravelInsurance,TravelBaggage,TravelMeals,RecordLocator,
+        SELECT passenger_hash,Revenue,TravelDate,BookingDate,TravelOrigin,TravelDestination,TravelDestination,TravelInsurance,TravelBaggage,TravelMeals,RecordLocator,IsCsp,
             ROW_NUMBER() OVER (PARTITION BY passenger_hash ORDER BY TravelDate DESC) AS row_num 
         FROM cdp_profiles
     ) AS subquery 
-    WHERE row_num <= 1000
+    WHERE row_num <= 250
     GROUP BY passenger_hash
     """
     )
@@ -250,14 +417,29 @@ def main_agg_compute(spark, df, save_path_prefix):
     result2.write.parquet(save_path_prefix + "/revenue_breakdown", mode="overwrite")
 
 
-def compute_ui(config_path, spark, profile_path, LOGGER):
+def compute_ui(config_path, spark, profile_path, LOGGER,day0_date):
     LOGGER.info("ccai Starting compute_ui")
     config = get_config(config_path)
+    num_cores = spark.sparkContext.defaultParallelism
+
+    end_date = profile_path.split("=")[1].strip('/')
+    LOGGER.info(f"end date - {end_date}, day0_date - {day0_date}")
+    spark.conf.set("spark.sql.shuffle.partitions", num_cores * 2)
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+    spark.conf.set("spark.sql.files.maxRecordsPerFile", 100000)
+    spark.conf.set("spark.sql.files.maxPartitionBytes", 52428800)
+
     spark.udf.register("most_travelled", most_travelled)
     spark.udf.register("booker_timeline", booker_timeline)
     spark.udf.register("passenger_timeline", passenger_timeline)
+    spark.udf.register("booker_timeline_new", booker_timeline_new)
+    spark.udf.register("passenger_timeline_new", passenger_timeline_new)
 
-    df = spark.read.parquet(profile_path).select(
+    partition_paths = get_paths(day0_date,end_date,profile_path,LOGGER)
+
+    LOGGER.info(f"ccai - ucp loaded partitions = {str(partition_paths)}")
+
+    df = spark.read.parquet(*partition_paths).select(
         "ProvisionalPrimaryKey",
         "PersonID",
         "PassengerID",
@@ -297,8 +479,15 @@ def compute_ui(config_path, spark, profile_path, LOGGER):
         "passenger_hash",
         "TravelSeat",
         "TravelDate",
-        "RecordLocator"
+        "RecordLocator",
+        "IsCsp"
     )
+    record_count = df.count()
+    LOGGER.info("ccai -> Load Data : {} rows".format( record_count))
+    df = df.dropDuplicates(subset = ['PassengerID'])
+    record_count = df.count()
+    LOGGER.info("ccai -> Load Data after dropping dups : {} rows".format( record_count))
+    
     exchange_rates = {
         "THB": 0.657845,
         "AED": 13.203984,
@@ -365,6 +554,6 @@ def compute_ui(config_path, spark, profile_path, LOGGER):
     LOGGER.info("ccai Starting ui compute passenger_compute")
     passenger_compute(spark, df, config["storageDetails"][3]["pathUrl"], LOGGER)
     LOGGER.info("ccai Starting ui compute booker_compute")
-    booker_compute(spark, df, config["storageDetails"][3]["pathUrl"])
+    booker_compute(spark, df, config["storageDetails"][3]["pathUrl"],LOGGER)
     LOGGER.info("ccai ui compute completed")
     return True
